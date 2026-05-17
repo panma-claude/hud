@@ -6,13 +6,13 @@ You are installing the panma-hud statusline into the user's Claude Code settings
 
 ## 1. Locate the script
 
-The statusline script lives inside this plugin at `statusline/panma-hud.sh`. Claude Code exposes the plugin directory through the `${CLAUDE_PLUGIN_ROOT}` environment variable at runtime, so the command you write into settings should be:
+The statusline script lives inside this plugin at `statusline/panma-hud.sh`. Claude Code installs plugins under `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/`, so the most portable command is a one-line bash wrapper that picks the highest-versioned install at runtime:
 
 ```
-${CLAUDE_PLUGIN_ROOT}/statusline/panma-hud.sh
+bash -c 'exec "$(ls -d ~/.claude/plugins/cache/*/panma-hud/*/statusline/panma-hud.sh 2>/dev/null | sort -V | tail -1)"'
 ```
 
-This keeps the install portable across machines and survives plugin updates without a hard-coded path.
+Why not `${CLAUDE_PLUGIN_ROOT}/statusline/panma-hud.sh`? That env var is only set when Claude Code runs hooks/commands defined **by the plugin itself**. A user-level `statusLine.command` is not plugin-scoped, so `${CLAUDE_PLUGIN_ROOT}` expands to empty there and the script never runs. The wrapper above sidesteps that and also survives plugin version bumps without a hard-coded path.
 
 ## 2. Pick the settings file
 
@@ -28,7 +28,7 @@ Read the chosen settings file and propose the merged result to the user. The tar
 {
   "statusLine": {
     "type": "command",
-    "command": "${CLAUDE_PLUGIN_ROOT}/statusline/panma-hud.sh",
+    "command": "bash -c 'exec \"$(ls -d ~/.claude/plugins/cache/*/panma-hud/*/statusline/panma-hud.sh 2>/dev/null | sort -V | tail -1)\"'",
     "padding": 1,
     "refreshInterval": 2
   }
@@ -50,7 +50,7 @@ On confirmation:
 2. Run the script once with a stub payload to prove it works end-to-end, e.g.:
    ```bash
    echo '{"model":{"display_name":"test"},"workspace":{"current_dir":"'"$PWD"'"}}' \
-     | "${CLAUDE_PLUGIN_ROOT}/statusline/panma-hud.sh"
+     | bash -c 'exec "$(ls -d ~/.claude/plugins/cache/*/panma-hud/*/statusline/panma-hud.sh 2>/dev/null | sort -V | tail -1)"'
    ```
    Show the user the output. If `jq` and `python3` are both missing, the script will say so — surface that and tell them to install one.
 3. Tell the user the HUD will appear on the next assistant message (or after `/clear`); a full Claude Code restart is not required.

@@ -33,12 +33,14 @@ Then wire it into your statusline:
 {
   "statusLine": {
     "type": "command",
-    "command": "${CLAUDE_PLUGIN_ROOT}/statusline/panma-hud.sh",
+    "command": "bash -c 'exec \"$(ls -d ~/.claude/plugins/cache/*/panma-hud/*/statusline/panma-hud.sh 2>/dev/null | sort -V | tail -1)\"'",
     "padding": 1,
     "refreshInterval": 2
   }
 }
 ```
+
+> Note: `${CLAUDE_PLUGIN_ROOT}` is only set for hooks/commands that the plugin itself defines — it doesn't expand inside a user-level `statusLine.command`. The wrapper above resolves the highest-versioned installed cache directory at runtime.
 
 The HUD appears on the next assistant message (or after `/clear`).
 
