@@ -2,15 +2,17 @@
 # panma-hud — Claude Code statusline
 #
 # Reads the JSON payload Claude Code sends on stdin and prints:
-#   line 1: session summary  (model · cwd · ctx% · tokens)
+#   line 1: session summary  (model · cwd · ctx% · 5h% · 7d%)
 #   line 2: harness snapshot (phase · workers · retries · STOP)  — only if .harness/state.json exists in cwd
 #
-# The tokens chip sums every .message.usage entry in the session transcript
-# (input + output + cache_creation + cache_read). On subscription plans the
-# dollar figure Claude Code reports is theoretical anyway — total tokens is
-# the more honest "what did this session actually consume" indicator.
+# The 5h / 7d chips call Anthropic's OAuth usage endpoint
+# (api.anthropic.com/api/oauth/usage) using the access token in
+# ~/.claude/.credentials.json, then render utilization% and time until reset.
+# Responses are cached for 30s in $TMPDIR to keep the 2s statusline refresh
+# from hammering the endpoint. If no credentials exist (e.g. you're not
+# signed into a subscription plan), the chips are simply omitted.
 #
-# Requires: bash + one JSON parser (jq preferred, falls back to python3).
+# Requires: bash + one JSON parser (jq preferred, falls back to python3) + curl.
 # Wire it up via your user settings.json:
 #   "statusLine": { "type": "command", "command": "<absolute path to this script>", "padding": 1, "refreshInterval": 2 }
 
@@ -96,6 +98,8 @@ fi
 model_name="$(payload_get '.model.display_name')"
 [ -z "$model_name" ] && model_name="$(payload_get '.model.id')"
 [ -z "$model_name" ] && model_name="?"
+# Trim parenthetical suffix (e.g. "Opus 4.7 (1M context)" → "Opus 4.7")
+model_name="${model_name%% (*}"
 
 cwd="$(payload_get '.workspace.current_dir')"
 [ -z "$cwd" ] && cwd="$(payload_get '.cwd')"
@@ -103,37 +107,84 @@ cwd="$(payload_get '.workspace.current_dir')"
 cwd_short="$(basename "$cwd")"
 
 ctx_pct="$(payload_get '.context_window.used_percentage')"
-transcript_path="$(payload_get '.transcript_path')"
 
-# --- tokens chip: sum .message.usage across the transcript ---------------
-total_tokens=""
-if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-  if [ "$PARSER" = jq ]; then
-    total_tokens=$(jq -R 'fromjson? | .message.usage // empty
-      | (.input_tokens // 0) + (.output_tokens // 0)
-        + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)' \
-      "$transcript_path" 2>/dev/null | awk '{s+=$1} END {print s+0}')
-  else
-    total_tokens=$(python3 -c '
+# --- usage chips: 5h / 7d utilization from Anthropic OAuth API -----------
+# Cached in $TMPDIR for 30s. If credentials or curl are missing, the chips
+# are simply omitted so the HUD still works on plain API-key setups.
+usage_5h_pct=""
+usage_5h_reset=""
+usage_7d_pct=""
+usage_7d_reset=""
+
+CRED="$HOME/.claude/.credentials.json"
+USAGE_CACHE="${TMPDIR:-/tmp}/panma-hud-usage-$(id -u 2>/dev/null || echo 0).json"
+USAGE_TTL=30
+
+if [ -f "$CRED" ] && command -v curl >/dev/null 2>&1; then
+  now_ts=$(date +%s)
+  cache_mtime=0
+  [ -s "$USAGE_CACHE" ] && cache_mtime=$(stat -c %Y "$USAGE_CACHE" 2>/dev/null || stat -f %m "$USAGE_CACHE" 2>/dev/null || echo 0)
+  if [ "$((now_ts - cache_mtime))" -ge "$USAGE_TTL" ]; then
+    if [ "$PARSER" = jq ]; then
+      _tok="$(jq -r '.claudeAiOauth.accessToken // empty' "$CRED" 2>/dev/null)"
+    else
+      _tok="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("claudeAiOauth",{}).get("accessToken",""))
+except: pass' "$CRED" 2>/dev/null)"
+    fi
+    if [ -n "$_tok" ]; then
+      _resp="$(curl -sS -m 5 \
+        -H "Authorization: Bearer $_tok" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        -H "Content-Type: application/json" \
+        https://api.anthropic.com/api/oauth/usage 2>/dev/null)"
+      if [ -n "$_resp" ] && printf '%s' "$_resp" | grep -q '"five_hour"\|"seven_day"'; then
+        umask 077
+        printf '%s' "$_resp" > "$USAGE_CACHE.tmp" 2>/dev/null && mv "$USAGE_CACHE.tmp" "$USAGE_CACHE" 2>/dev/null
+      fi
+    fi
+    unset _tok _resp
+  fi
+
+  if [ -s "$USAGE_CACHE" ]; then
+    if [ "$PARSER" = jq ]; then
+      usage_5h_pct="$(jq -r '.five_hour.utilization // empty' "$USAGE_CACHE" 2>/dev/null)"
+      usage_5h_reset="$(jq -r '.five_hour.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)"
+      usage_7d_pct="$(jq -r '.seven_day.utilization // empty' "$USAGE_CACHE" 2>/dev/null)"
+      usage_7d_reset="$(jq -r '.seven_day.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)"
+    else
+      _usage_lines="$(python3 -c '
 import json, sys
-total = 0
-try:
-    with open(sys.argv[1]) as f:
-        for line in f:
-            try:
-                msg = json.loads(line).get("message")
-                u = msg.get("usage") if isinstance(msg, dict) else None
-                if isinstance(u, dict):
-                    total += (u.get("input_tokens") or 0) + (u.get("output_tokens") or 0)
-                    total += (u.get("cache_creation_input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0)
-            except Exception:
-                continue
-except Exception:
-    pass
-print(total)
-' "$transcript_path" 2>/dev/null)
+try: d = json.load(open(sys.argv[1]))
+except Exception: d = {}
+for k in ("five_hour","seven_day"):
+    v = d.get(k) or {}
+    print(v.get("utilization") if v.get("utilization") is not None else "")
+    print(v.get("resets_at") or "")
+' "$USAGE_CACHE" 2>/dev/null)"
+      usage_5h_pct="$(printf '%s\n' "$_usage_lines" | sed -n '1p')"
+      usage_5h_reset="$(printf '%s\n' "$_usage_lines" | sed -n '2p')"
+      usage_7d_pct="$(printf '%s\n' "$_usage_lines" | sed -n '3p')"
+      usage_7d_reset="$(printf '%s\n' "$_usage_lines" | sed -n '4p')"
+      unset _usage_lines
+    fi
   fi
 fi
+
+# Format an ISO-8601 reset timestamp as "Nd Nh" / "Nh Nm" / "Nm"
+fmt_reset() {
+  local iso="$1" target now diff d h m
+  [ -z "$iso" ] && return
+  target=$(date -d "$iso" +%s 2>/dev/null) || return
+  now=$(date +%s)
+  diff=$((target - now))
+  [ "$diff" -le 0 ] && { printf 'reset'; return; }
+  d=$((diff / 86400)); h=$(((diff % 86400) / 3600)); m=$(((diff % 3600) / 60))
+  if   [ "$d" -gt 0 ]; then printf '%dd %dh' "$d" "$h"
+  elif [ "$h" -gt 0 ]; then printf '%dh %dm' "$h" "$m"
+  else                      printf '%dm' "$m"
+  fi
+}
 
 # --- line 1: session summary ---------------------------------------------
 CYAN='\033[36m'; DIM='\033[2m'; YEL='\033[33m'; RED='\033[31m'; GRN='\033[32m'
@@ -149,13 +200,28 @@ if [ -n "$ctx_pct" ]; then
   line1="${line1}${DIM} · ${RST}${ctx_col}ctx ${ctx_int}%${RST}"
 fi
 
-if [ -n "$total_tokens" ] && [ "$total_tokens" != "0" ]; then
-  tok_fmt=$(awk -v n="$total_tokens" 'BEGIN {
-    if (n >= 1000000) printf "%.1fM", n/1000000;
-    else if (n >= 1000)    printf "%.0fk", n/1000;
-    else                   printf "%d", n;
-  }')
-  line1="${line1}${DIM} · ${RST}${tok_fmt} tok"
+render_usage_chip() {
+  local label="$1" pct="$2" reset_iso="$3" pct_int col rs
+  [ -z "$pct" ] && return
+  pct_int=$(printf '%.0f' "$pct" 2>/dev/null) || pct_int=0
+  col="$GRN"
+  [ "$pct_int" -ge 70 ] 2>/dev/null && col="$YEL"
+  [ "$pct_int" -ge 90 ] 2>/dev/null && col="$RED"
+  rs="$(fmt_reset "$reset_iso")"
+  if [ -n "$rs" ]; then
+    printf '%b%s:%d%%%b(%s)' "$col" "$label" "$pct_int" "$RST" "$rs"
+  else
+    printf '%b%s:%d%%%b' "$col" "$label" "$pct_int" "$RST"
+  fi
+}
+
+if [ -n "$usage_5h_pct" ]; then
+  chip="$(render_usage_chip 5h "$usage_5h_pct" "$usage_5h_reset")"
+  line1="${line1}${DIM} · ${RST}${chip}"
+fi
+if [ -n "$usage_7d_pct" ]; then
+  chip="$(render_usage_chip 7d "$usage_7d_pct" "$usage_7d_reset")"
+  line1="${line1}${DIM} · ${RST}${chip}"
 fi
 
 printf '%b\n' "$line1"
