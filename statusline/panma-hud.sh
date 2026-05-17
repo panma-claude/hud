@@ -2,17 +2,17 @@
 # panma-hud — Claude Code statusline
 #
 # Reads the JSON payload Claude Code sends on stdin and prints:
-#   line 1: session summary  (model · cwd · ctx% · 5h% · 7d%)
-#   line 2: harness snapshot (phase · workers · retries · STOP)  — only if .harness/state.json exists in cwd
+#   line 1:  session summary  (model · cwd · "session name" · ctx% · 5h% · 7d% · diff · 200k warn)
+#   line 2:  harness snapshot (phase · workers · retries · STOP)         — only if .harness/state.json exists in cwd
+#   line 3+: one indented line per active worker (domain · elapsed)      — only when active_workers ≥ 1
 #
-# The 5h / 7d chips call Anthropic's OAuth usage endpoint
-# (api.anthropic.com/api/oauth/usage) using the access token in
-# ~/.claude/.credentials.json, then render utilization% and time until reset.
-# Responses are cached for 30s in $TMPDIR to keep the 2s statusline refresh
-# from hammering the endpoint. If no credentials exist (e.g. you're not
-# signed into a subscription plan), the chips are simply omitted.
+# Claude Code already ships rate-limit utilization for the active OAuth
+# session inside the stdin payload (`.rate_limits.{five_hour,seven_day}`),
+# so the 5h / 7d chips just read those fields. No API calls, no caching,
+# no credentials handling — when the user is on a plain API-key setup the
+# fields are absent and the chips are silently skipped.
 #
-# Requires: bash + one JSON parser (jq preferred, falls back to python3) + curl.
+# Requires: bash + one JSON parser (jq preferred, falls back to python3).
 # Wire it up via your user settings.json:
 #   "statusLine": { "type": "command", "command": "<absolute path to this script>", "padding": 1, "refreshInterval": 2 }
 
@@ -107,75 +107,29 @@ cwd="$(payload_get '.workspace.current_dir')"
 cwd_short="$(basename "$cwd")"
 
 ctx_pct="$(payload_get '.context_window.used_percentage')"
+session_name="$(payload_get '.session_name')"
+lines_added="$(payload_get '.cost.total_lines_added')"
+lines_removed="$(payload_get '.cost.total_lines_removed')"
+exceeds_200k="$(payload_get '.exceeds_200k_tokens')"
 
-# --- usage chips: 5h / 7d utilization from Anthropic OAuth API -----------
-# Cached in $TMPDIR for 30s. If credentials or curl are missing, the chips
-# are simply omitted so the HUD still works on plain API-key setups.
-usage_5h_pct=""
-usage_5h_reset=""
-usage_7d_pct=""
-usage_7d_reset=""
+# --- usage chips: 5h / 7d utilization from the payload -------------------
+# Claude Code's stdin payload already includes .rate_limits.{five_hour,seven_day}
+# for OAuth sessions (resets_at is a Unix epoch). On plain API-key sessions
+# these fields are absent, in which case the chips are silently omitted.
+usage_5h_pct="$(payload_get '.rate_limits.five_hour.used_percentage')"
+usage_5h_reset="$(payload_get '.rate_limits.five_hour.resets_at')"
+usage_7d_pct="$(payload_get '.rate_limits.seven_day.used_percentage')"
+usage_7d_reset="$(payload_get '.rate_limits.seven_day.resets_at')"
 
-CRED="$HOME/.claude/.credentials.json"
-USAGE_CACHE="${TMPDIR:-/tmp}/panma-hud-usage-$(id -u 2>/dev/null || echo 0).json"
-USAGE_TTL=30
-
-if [ -f "$CRED" ] && command -v curl >/dev/null 2>&1; then
-  now_ts=$(date +%s)
-  cache_mtime=0
-  [ -s "$USAGE_CACHE" ] && cache_mtime=$(stat -c %Y "$USAGE_CACHE" 2>/dev/null || stat -f %m "$USAGE_CACHE" 2>/dev/null || echo 0)
-  if [ "$((now_ts - cache_mtime))" -ge "$USAGE_TTL" ]; then
-    if [ "$PARSER" = jq ]; then
-      _tok="$(jq -r '.claudeAiOauth.accessToken // empty' "$CRED" 2>/dev/null)"
-    else
-      _tok="$(python3 -c 'import json,sys
-try: print(json.load(open(sys.argv[1])).get("claudeAiOauth",{}).get("accessToken",""))
-except: pass' "$CRED" 2>/dev/null)"
-    fi
-    if [ -n "$_tok" ]; then
-      _resp="$(curl -sS -m 5 \
-        -H "Authorization: Bearer $_tok" \
-        -H "anthropic-beta: oauth-2025-04-20" \
-        -H "Content-Type: application/json" \
-        https://api.anthropic.com/api/oauth/usage 2>/dev/null)"
-      if [ -n "$_resp" ] && printf '%s' "$_resp" | grep -q '"five_hour"\|"seven_day"'; then
-        umask 077
-        printf '%s' "$_resp" > "$USAGE_CACHE.tmp" 2>/dev/null && mv "$USAGE_CACHE.tmp" "$USAGE_CACHE" 2>/dev/null
-      fi
-    fi
-    unset _tok _resp
-  fi
-
-  if [ -s "$USAGE_CACHE" ]; then
-    if [ "$PARSER" = jq ]; then
-      usage_5h_pct="$(jq -r '.five_hour.utilization // empty' "$USAGE_CACHE" 2>/dev/null)"
-      usage_5h_reset="$(jq -r '.five_hour.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)"
-      usage_7d_pct="$(jq -r '.seven_day.utilization // empty' "$USAGE_CACHE" 2>/dev/null)"
-      usage_7d_reset="$(jq -r '.seven_day.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)"
-    else
-      _usage_lines="$(python3 -c '
-import json, sys
-try: d = json.load(open(sys.argv[1]))
-except Exception: d = {}
-for k in ("five_hour","seven_day"):
-    v = d.get(k) or {}
-    print(v.get("utilization") if v.get("utilization") is not None else "")
-    print(v.get("resets_at") or "")
-' "$USAGE_CACHE" 2>/dev/null)"
-      usage_5h_pct="$(printf '%s\n' "$_usage_lines" | sed -n '1p')"
-      usage_5h_reset="$(printf '%s\n' "$_usage_lines" | sed -n '2p')"
-      usage_7d_pct="$(printf '%s\n' "$_usage_lines" | sed -n '3p')"
-      usage_7d_reset="$(printf '%s\n' "$_usage_lines" | sed -n '4p')"
-      unset _usage_lines
-    fi
-  fi
-fi
-
-# Format an ISO-8601 reset timestamp as "Nd Nh" / "Nh Nm" / "Nm"
+# Format a Unix-epoch (or ISO) reset timestamp as "Nd Nh" / "Nh Nm" / "Nm"
 fmt_reset() {
-  local iso="$1" target now diff d h m
-  [ -z "$iso" ] && return
-  target=$(date -d "$iso" +%s 2>/dev/null) || return
+  local ts="$1" target now diff d h m
+  [ -z "$ts" ] && return
+  if printf '%s' "$ts" | grep -qE '^[0-9]+$'; then
+    target=$ts
+  else
+    target=$(date -d "$ts" +%s 2>/dev/null) || return
+  fi
   now=$(date +%s)
   diff=$((target - now))
   [ "$diff" -le 0 ] && { printf 'reset'; return; }
@@ -191,6 +145,16 @@ CYAN='\033[36m'; DIM='\033[2m'; YEL='\033[33m'; RED='\033[31m'; GRN='\033[32m'
 MAG='\033[35m'; BOLD='\033[1m'; RST='\033[0m'
 
 line1="${CYAN}${model_name}${RST}${DIM} · ${RST}${cwd_short}"
+
+if [ -n "$session_name" ]; then
+  # Truncate to 30 chars so a verbose title doesn't push the quota chips off-screen
+  if [ "${#session_name}" -gt 30 ]; then
+    session_short="${session_name:0:29}…"
+  else
+    session_short="$session_name"
+  fi
+  line1="${line1}${DIM} · \"${session_short}\"${RST}"
+fi
 
 if [ -n "$ctx_pct" ]; then
   ctx_int=$(printf '%.0f' "$ctx_pct" 2>/dev/null || echo 0)
@@ -222,6 +186,16 @@ fi
 if [ -n "$usage_7d_pct" ]; then
   chip="$(render_usage_chip 7d "$usage_7d_pct" "$usage_7d_reset")"
   line1="${line1}${DIM} · ${RST}${chip}"
+fi
+
+# Diff stats — only shown when there's actually been activity this session
+if { [ -n "$lines_added" ] && [ "$lines_added" != "0" ]; } || \
+   { [ -n "$lines_removed" ] && [ "$lines_removed" != "0" ]; }; then
+  line1="${line1}${DIM} · ${RST}${GRN}+${lines_added:-0}${RST}/${RED}−${lines_removed:-0}${RST}"
+fi
+
+if [ "$exceeds_200k" = "true" ]; then
+  line1="${line1}${DIM} · ${RST}${RED}${BOLD}⚠ 200k+${RST}"
 fi
 
 printf '%b\n' "$line1"
@@ -289,3 +263,51 @@ if [ -f "$stop_file" ]; then
 fi
 
 printf '%b\n' "$line2"
+
+# --- line 3+: one indented line per active worker ------------------------
+# Each entry shows the worker's domain (or executor as fallback) plus elapsed
+# time since started_at. Skipped entirely when there are no active workers.
+
+list_workers() {
+  if [ "$PARSER" = jq ]; then
+    jq -r '(.active_workers // []) | .[] | [.domain // .executor // "?", .started_at // ""] | @tsv' \
+      "$state_file" 2>/dev/null
+  else
+    python3 -c '
+import json, sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+for w in (d.get("active_workers") or []):
+    name = w.get("domain") or w.get("executor") or "?"
+    started = w.get("started_at") or ""
+    print(f"{name}\t{started}")
+' "$state_file" 2>/dev/null
+  fi
+}
+
+fmt_elapsed() {
+  local started="$1" started_s diff h m s
+  [ -z "$started" ] && return
+  started_s=$(date -d "$started" +%s 2>/dev/null) || return
+  diff=$(( $(date +%s) - started_s ))
+  [ "$diff" -lt 0 ] && diff=0
+  if   [ "$diff" -ge 3600 ]; then
+    h=$((diff / 3600)); m=$(((diff % 3600) / 60))
+    printf '%dh %dm' "$h" "$m"
+  elif [ "$diff" -ge 60 ]; then
+    m=$((diff / 60)); s=$((diff % 60))
+    printf '%dm %ds' "$m" "$s"
+  else
+    printf '%ds' "$diff"
+  fi
+}
+
+while IFS=$'\t' read -r w_name w_started; do
+  [ -z "$w_name" ] && continue
+  elapsed="$(fmt_elapsed "$w_started")"
+  if [ -n "$elapsed" ]; then
+    printf '%b  ↳ %b%s%b %b(%s)%b\n' "$DIM" "$CYAN" "$w_name" "$RST" "$DIM" "$elapsed" "$RST"
+  else
+    printf '%b  ↳ %b%s%b\n' "$DIM" "$CYAN" "$w_name" "$RST"
+  fi
+done < <(list_workers)
