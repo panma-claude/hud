@@ -2,8 +2,13 @@
 # panma-hud — Claude Code statusline
 #
 # Reads the JSON payload Claude Code sends on stdin and prints:
-#   line 1: session summary  (model · cwd · ctx% · $cost)
+#   line 1: session summary  (model · cwd · ctx% · tokens)
 #   line 2: harness snapshot (phase · workers · retries · STOP)  — only if .harness/state.json exists in cwd
+#
+# The tokens chip sums every .message.usage entry in the session transcript
+# (input + output + cache_creation + cache_read). On subscription plans the
+# dollar figure Claude Code reports is theoretical anyway — total tokens is
+# the more honest "what did this session actually consume" indicator.
 #
 # Requires: bash + one JSON parser (jq preferred, falls back to python3).
 # Wire it up via your user settings.json:
@@ -98,7 +103,37 @@ cwd="$(payload_get '.workspace.current_dir')"
 cwd_short="$(basename "$cwd")"
 
 ctx_pct="$(payload_get '.context_window.used_percentage')"
-cost_usd="$(payload_get '.cost.total_cost_usd')"
+transcript_path="$(payload_get '.transcript_path')"
+
+# --- tokens chip: sum .message.usage across the transcript ---------------
+total_tokens=""
+if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+  if [ "$PARSER" = jq ]; then
+    total_tokens=$(jq -R 'fromjson? | .message.usage // empty
+      | (.input_tokens // 0) + (.output_tokens // 0)
+        + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)' \
+      "$transcript_path" 2>/dev/null | awk '{s+=$1} END {print s+0}')
+  else
+    total_tokens=$(python3 -c '
+import json, sys
+total = 0
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            try:
+                msg = json.loads(line).get("message")
+                u = msg.get("usage") if isinstance(msg, dict) else None
+                if isinstance(u, dict):
+                    total += (u.get("input_tokens") or 0) + (u.get("output_tokens") or 0)
+                    total += (u.get("cache_creation_input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0)
+            except Exception:
+                continue
+except Exception:
+    pass
+print(total)
+' "$transcript_path" 2>/dev/null)
+  fi
+fi
 
 # --- line 1: session summary ---------------------------------------------
 CYAN='\033[36m'; DIM='\033[2m'; YEL='\033[33m'; RED='\033[31m'; GRN='\033[32m'
@@ -114,9 +149,13 @@ if [ -n "$ctx_pct" ]; then
   line1="${line1}${DIM} · ${RST}${ctx_col}ctx ${ctx_int}%${RST}"
 fi
 
-if [ -n "$cost_usd" ]; then
-  cost_fmt=$(printf '%.2f' "$cost_usd" 2>/dev/null || echo "$cost_usd")
-  line1="${line1}${DIM} · ${RST}\$${cost_fmt}"
+if [ -n "$total_tokens" ] && [ "$total_tokens" != "0" ]; then
+  tok_fmt=$(awk -v n="$total_tokens" 'BEGIN {
+    if (n >= 1000000) printf "%.1fM", n/1000000;
+    else if (n >= 1000)    printf "%.0fk", n/1000;
+    else                   printf "%d", n;
+  }')
+  line1="${line1}${DIM} · ${RST}${tok_fmt} tok"
 fi
 
 printf '%b\n' "$line1"

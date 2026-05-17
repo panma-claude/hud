@@ -3,12 +3,14 @@
 Two-line heads-up display for Claude Code, surfaced through the `statusLine` setting.
 
 ```
-Opus 4.7 · my-repo · ctx 42% · $0.17
+Opus 4.7 · my-repo · ctx 42% · 184k tok
 harness#3 executing · 2↻/1✓ +1q · retry 1/5
 ```
 
-- **Line 1** — model · cwd basename · context window % · cumulative cost
+- **Line 1** — model · cwd basename · context window % · cumulative session tokens (input + output + cache_creation + cache_read, summed from the transcript)
 - **Line 2** — appears only when `.harness/state.json` exists in the cwd: cycle id, phase, active/completed workers (+queue depth), retry budget, termination reason, and a red `■ STOP` if `.harness/STOP` is present
+
+> The tokens chip is independent of plan: it's a literal count from the transcript, so it's a useful "quota burn" indicator on subscription plans where the dollar figure Claude Code emits is theoretical.
 
 Pairs with [panma-harness](https://github.com/panma-claude/harness), but the session-summary line is useful on its own in any project.
 
