@@ -1,0 +1,8 @@
+.DS_Store
+*.log
+node_modules/
+.env
+.env.local
+
+# Local-only sandbox for testing the plugin against a project
+.test-target/

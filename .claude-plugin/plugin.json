@@ -1,0 +1,17 @@
+{
+  "name": "panma-hud",
+  "version": "0.0.1",
+  "description": "Heads-up display for Claude Code. A statusline script that shows session info (model, cwd, context %, cost) on line 1 and live panma-harness cycle state (phase, workers, retries, kill switch) on line 2 when .harness/state.json is present.",
+  "author": {
+    "name": "panma"
+  },
+  "repository": "https://github.com/panma-claude/hud",
+  "keywords": [
+    "claude-code",
+    "plugin",
+    "statusline",
+    "hud",
+    "harness"
+  ],
+  "commands": "./commands/"
+}
