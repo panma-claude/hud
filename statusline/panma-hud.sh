@@ -2,7 +2,7 @@
 # panma-hud — Claude Code statusline
 #
 # Reads the JSON payload Claude Code sends on stdin and prints:
-#   line 1:  session summary  (model · cwd · "session name" · ctx% · 5h% · 7d% · diff · 200k warn)
+#   line 1:  session summary  (model · "session name" · ctx%(⚠ 200k+) · 5h% · 7d%)
 #   line 2:  harness snapshot (phase · workers · retries · STOP)         — only if .harness/state.json exists in cwd
 #   line 3+: one indented line per active worker (domain · elapsed)      — only when active_workers ≥ 1
 #
@@ -101,16 +101,30 @@ model_name="$(payload_get '.model.display_name')"
 # Trim parenthetical suffix (e.g. "Opus 4.7 (1M context)" → "Opus 4.7")
 model_name="${model_name%% (*}"
 
+# cwd is still needed below for resolving .harness/state.json, but is no longer
+# displayed on line 1 (the basename chip was visual noise).
 cwd="$(payload_get '.workspace.current_dir')"
 [ -z "$cwd" ] && cwd="$(payload_get '.cwd')"
 [ -z "$cwd" ] && cwd="$PWD"
-cwd_short="$(basename "$cwd")"
 
 ctx_pct="$(payload_get '.context_window.used_percentage')"
 session_name="$(payload_get '.session_name')"
-lines_added="$(payload_get '.cost.total_lines_added')"
-lines_removed="$(payload_get '.cost.total_lines_removed')"
 exceeds_200k="$(payload_get '.exceeds_200k_tokens')"
+
+# panma-harness sidecar title override. The harness plugin instructs the main
+# Claude to write a ≤15-char Korean summary of each request to a per-session
+# sidecar in $TMPDIR; if present, it takes precedence over the payload's
+# session_name (which is only set by --name or /rename). Falls through silently
+# when the file isn't there (no panma-harness installed, no write yet, etc.).
+session_id="$(payload_get '.session_id')"
+if [ -n "$session_id" ]; then
+  sid_safe="$(printf '%s' "$session_id" | tr -c 'A-Za-z0-9._-' '_')"
+  sidecar="${TMPDIR:-/tmp}/panma-harness-title-${sid_safe}.txt"
+  if [ -s "$sidecar" ]; then
+    sidecar_title="$(head -1 "$sidecar" 2>/dev/null | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -n "$sidecar_title" ] && session_name="$sidecar_title"
+  fi
+fi
 
 # --- usage chips: 5h / 7d utilization from the payload -------------------
 # Claude Code's stdin payload already includes .rate_limits.{five_hour,seven_day}
@@ -144,7 +158,7 @@ fmt_reset() {
 CYAN='\033[36m'; DIM='\033[2m'; YEL='\033[33m'; RED='\033[31m'; GRN='\033[32m'
 MAG='\033[35m'; BOLD='\033[1m'; RST='\033[0m'
 
-line1="${CYAN}${model_name}${RST}${DIM} · ${RST}${cwd_short}"
+line1="${CYAN}${model_name}${RST}"
 
 if [ -n "$session_name" ]; then
   # Truncate to 30 chars so a verbose title doesn't push the quota chips off-screen
@@ -162,6 +176,12 @@ if [ -n "$ctx_pct" ]; then
   [ "$ctx_int" -ge 70 ] 2>/dev/null && ctx_col="$YEL"
   [ "$ctx_int" -ge 90 ] 2>/dev/null && ctx_col="$RED"
   line1="${line1}${DIM} · ${RST}${ctx_col}ctx ${ctx_int}%${RST}"
+  # Long-context pricing kicks in when the request's input exceeds 200k tokens.
+  # Inline the warning into the ctx chip so the user sees it where they're
+  # already reading the context number, rather than as a separate chip.
+  if [ "$exceeds_200k" = "true" ]; then
+    line1="${line1}${RED}${BOLD}(⚠ 200k+)${RST}"
+  fi
 fi
 
 render_usage_chip() {
@@ -186,16 +206,6 @@ fi
 if [ -n "$usage_7d_pct" ]; then
   chip="$(render_usage_chip 7d "$usage_7d_pct" "$usage_7d_reset")"
   line1="${line1}${DIM} · ${RST}${chip}"
-fi
-
-# Diff stats — only shown when there's actually been activity this session
-if { [ -n "$lines_added" ] && [ "$lines_added" != "0" ]; } || \
-   { [ -n "$lines_removed" ] && [ "$lines_removed" != "0" ]; }; then
-  line1="${line1}${DIM} · ${RST}${GRN}+${lines_added:-0}${RST}/${RED}−${lines_removed:-0}${RST}"
-fi
-
-if [ "$exceeds_200k" = "true" ]; then
-  line1="${line1}${DIM} · ${RST}${RED}${BOLD}⚠ 200k+${RST}"
 fi
 
 printf '%b\n' "$line1"
