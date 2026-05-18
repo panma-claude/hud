@@ -153,6 +153,36 @@ fmt_reset() {
   fi
 }
 
+# Format a past timestamp (Unix-epoch or ISO) as a single-unit "N{s,m,h,d}".
+# Used by the last-cycle chip when no .harness/state.json is present.
+fmt_ago() {
+  local ts="$1" target now diff
+  [ -z "$ts" ] && return
+  if printf '%s' "$ts" | grep -qE '^[0-9]+$'; then
+    target=$ts
+  else
+    target=$(date -d "$ts" +%s 2>/dev/null) || return
+  fi
+  now=$(date +%s)
+  diff=$((now - target))
+  [ "$diff" -lt 0 ] && diff=0
+  if   [ "$diff" -lt 60 ];    then printf '%ds' "$diff"
+  elif [ "$diff" -lt 3600 ];  then printf '%dm' "$((diff / 60))"
+  elif [ "$diff" -lt 86400 ]; then printf '%dh' "$((diff / 3600))"
+  else                              printf '%dd' "$((diff / 86400))"
+  fi
+}
+
+# Format a raw integer duration (seconds) as compact "Ns" / "Nm Ns" / "Nh Nm".
+fmt_elapsed_sec() {
+  local s="$1"
+  [ -z "$s" ] && { printf '0s'; return; }
+  if   [ "$s" -ge 3600 ]; then printf '%dh %dm' "$((s / 3600))" "$(((s % 3600) / 60))"
+  elif [ "$s" -ge 60 ];   then printf '%dm %ds' "$((s / 60))" "$((s % 60))"
+  else                         printf '%ds' "$s"
+  fi
+}
+
 # --- line 1: session summary ---------------------------------------------
 CYAN='\033[36m'; DIM='\033[2m'; YEL='\033[33m'; RED='\033[31m'; GRN='\033[32m'
 MAG='\033[35m'; BOLD='\033[1m'; RST='\033[0m'
@@ -208,6 +238,50 @@ state_file="${cwd}/.harness/state.json"
 stop_file="${cwd}/.harness/STOP"
 
 if [ ! -f "$state_file" ]; then
+  # Fallback: show the most recent archived cycle from .harness/history/INDEX.json
+  # (panma-harness writes this on every termination, see harness-iterate.md §8).
+  index_file="${cwd}/.harness/history/INDEX.json"
+  if [ -f "$index_file" ] && state_validate "$index_file"; then
+    if [ "$PARSER" = jq ]; then
+      tsv="$(jq -r '
+        (. // []) | if length == 0 then empty
+        else .[-1] | [.verdict // "", .request // "", (.elapsed_sec // 0 | tostring), .finished_at // ""] | @tsv
+        end
+      ' "$index_file" 2>/dev/null)"
+    else
+      tsv="$(python3 -c '
+import json, sys
+try: arr = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+if not isinstance(arr, list) or len(arr) == 0: sys.exit(0)
+e = arr[-1]
+print("\t".join([
+  str(e.get("verdict") or ""),
+  str(e.get("request") or ""),
+  str(e.get("elapsed_sec") or 0),
+  str(e.get("finished_at") or ""),
+]))
+' "$index_file" 2>/dev/null)"
+    fi
+    if [ -n "$tsv" ]; then
+      IFS=$'\t' read -r l_verdict l_request l_elapsed l_finished <<< "$tsv"
+      case "$l_verdict" in
+        complete)   l_icon="✓"; l_col="$GRN" ;;
+        needs_user) l_icon="✗"; l_col="$RED" ;;
+        *)          l_icon="·"; l_col="$DIM" ;;
+      esac
+      # Truncate long requests so the chip fits in narrow terminals
+      if [ "${#l_request}" -gt 40 ]; then
+        l_request="${l_request:0:39}…"
+      fi
+      l_elapsed_chip="$(fmt_elapsed_sec "${l_elapsed:-0}")"
+      l_ago_chip="$(fmt_ago "$l_finished")"
+      [ -z "$l_ago_chip" ] && l_ago_chip="?"
+      printf '%bharness · last:%b %b%s "%s"%b %b(%s, %s ago)%b\n' \
+        "$DIM" "$RST" "$l_col" "$l_icon" "$l_request" "$RST" \
+        "$DIM" "$l_elapsed_chip" "$l_ago_chip" "$RST"
+    fi
+  fi
   exit 0
 fi
 
