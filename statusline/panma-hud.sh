@@ -2,13 +2,13 @@
 # panma-hud — Claude Code statusline
 #
 # Reads the JSON payload Claude Code sends on stdin and prints:
-#   line 1:  session summary  (model · "session name" · ctx%(⚠ 200k+) · 5h% · 7d%)
+#   line 1:  session summary  (model · "session name" · ctx:% · 5h% · wk%)
 #   line 2:  harness snapshot (phase · workers · retries · STOP)         — only if .harness/state.json exists in cwd
 #   line 3+: one indented line per active worker (domain · elapsed)      — only when active_workers ≥ 1
 #
 # Claude Code already ships rate-limit utilization for the active OAuth
 # session inside the stdin payload (`.rate_limits.{five_hour,seven_day}`),
-# so the 5h / 7d chips just read those fields. No API calls, no caching,
+# so the 5h / wk chips just read those fields. No API calls, no caching,
 # no credentials handling — when the user is on a plain API-key setup the
 # fields are absent and the chips are silently skipped.
 #
@@ -109,7 +109,6 @@ cwd="$(payload_get '.workspace.current_dir')"
 
 ctx_pct="$(payload_get '.context_window.used_percentage')"
 session_name="$(payload_get '.session_name')"
-exceeds_200k="$(payload_get '.exceeds_200k_tokens')"
 
 # panma-harness sidecar title override. The harness plugin instructs the main
 # Claude to write a ≤15-char Korean summary of each request to a per-session
@@ -126,7 +125,7 @@ if [ -n "$session_id" ]; then
   fi
 fi
 
-# --- usage chips: 5h / 7d utilization from the payload -------------------
+# --- usage chips: 5h / wk utilization from the payload -------------------
 # Claude Code's stdin payload already includes .rate_limits.{five_hour,seven_day}
 # for OAuth sessions (resets_at is a Unix epoch). On plain API-key sessions
 # these fields are absent, in which case the chips are silently omitted.
@@ -167,7 +166,7 @@ if [ -n "$session_name" ]; then
   else
     session_short="$session_name"
   fi
-  line1="${line1}${DIM} · \"${session_short}\"${RST}"
+  line1="${line1}${DIM} · ${RST}\"${session_short}\""
 fi
 
 if [ -n "$ctx_pct" ]; then
@@ -175,13 +174,7 @@ if [ -n "$ctx_pct" ]; then
   ctx_col="$GRN"
   [ "$ctx_int" -ge 70 ] 2>/dev/null && ctx_col="$YEL"
   [ "$ctx_int" -ge 90 ] 2>/dev/null && ctx_col="$RED"
-  line1="${line1}${DIM} · ${RST}${ctx_col}ctx ${ctx_int}%${RST}"
-  # Long-context pricing kicks in when the request's input exceeds 200k tokens.
-  # Inline the warning into the ctx chip so the user sees it where they're
-  # already reading the context number, rather than as a separate chip.
-  if [ "$exceeds_200k" = "true" ]; then
-    line1="${line1}${RED}${BOLD}(⚠ 200k+)${RST}"
-  fi
+  line1="${line1}${DIM} · ${RST}${ctx_col}ctx:${ctx_int}%${RST}"
 fi
 
 render_usage_chip() {
@@ -204,7 +197,7 @@ if [ -n "$usage_5h_pct" ]; then
   line1="${line1}${DIM} · ${RST}${chip}"
 fi
 if [ -n "$usage_7d_pct" ]; then
-  chip="$(render_usage_chip 7d "$usage_7d_pct" "$usage_7d_reset")"
+  chip="$(render_usage_chip wk "$usage_7d_pct" "$usage_7d_reset")"
   line1="${line1}${DIM} · ${RST}${chip}"
 fi
 

@@ -3,14 +3,14 @@
 Multi-line heads-up display for Claude Code, surfaced through the `statusLine` setting.
 
 ```
-Opus 4.7 · my-repo · "Add new feature" · ctx 42% · 5h:11%(3h 39m) · 7d:6%(10h 39m) · +168/−57
+Opus 4.7 · my-repo · "Add new feature" · ctx:42% · 5h:11%(3h 39m) · wk:6%(10h 39m) · +168/−57
 harness#3 executing · 3↻/1✓ +1q · retry 1/5
   ↳ db (2m 31s)
   ↳ backend (1m 13s)
   ↳ frontend (46s)
 ```
 
-- **Line 1** — model · cwd basename · AI-generated session name · context window % · 5h quota · 7d quota · session diff stats (+added / −removed). A red `⚠ 200k+` chip appears when `.exceeds_200k_tokens` is true.
+- **Line 1** — model · cwd basename · AI-generated session name · context window % · 5h quota · weekly quota · session diff stats (+added / −removed).
 - **Line 2** — appears only when `.harness/state.json` exists in the cwd: cycle id, phase, active/completed workers (+queue depth), retry budget, termination reason, and a red `■ STOP` if `.harness/STOP` is present.
 - **Line 3+** — one indented line per active harness worker (domain + elapsed time), only when there are active workers. Skipped entirely otherwise.
 
