@@ -183,6 +183,24 @@ fmt_elapsed_sec() {
   fi
 }
 
+# Format an ISO-8601 (or epoch) past timestamp as elapsed-since-then.
+fmt_elapsed() {
+  local started="$1" started_s diff h m s
+  [ -z "$started" ] && return
+  started_s=$(date -d "$started" +%s 2>/dev/null) || return
+  diff=$(( $(date +%s) - started_s ))
+  [ "$diff" -lt 0 ] && diff=0
+  if   [ "$diff" -ge 3600 ]; then
+    h=$((diff / 3600)); m=$(((diff % 3600) / 60))
+    printf '%dh %dm' "$h" "$m"
+  elif [ "$diff" -ge 60 ]; then
+    m=$((diff / 60)); s=$((diff % 60))
+    printf '%dm %ds' "$m" "$s"
+  else
+    printf '%ds' "$diff"
+  fi
+}
+
 # --- line 1: session summary ---------------------------------------------
 CYAN='\033[36m'; DIM='\033[2m'; YEL='\033[33m'; RED='\033[31m'; GRN='\033[32m'
 MAG='\033[35m'; BOLD='\033[1m'; RST='\033[0m'
@@ -298,6 +316,7 @@ active_n="$(state_get '(.active_workers // []) | length' "$state_file")"
 done_n="$(state_get '(.completed_workers // []) | length' "$state_file")"
 pending_n="$(state_get '(.pending_specs // []) | length' "$state_file")"
 termination="$(state_get '.termination_reason' "$state_file")"
+cycle_started_at="$(state_get '.cycle_started_at' "$state_file")"
 
 # Phase color
 case "$phase" in
@@ -320,11 +339,24 @@ fi
 
 if [ -n "${retry_limit:-}" ] && [ "$retry_limit" != "0" ]; then
   retry_col="$DIM"
+  retry_suffix=""
   if [ "${retry:-0}" -gt 0 ] 2>/dev/null; then
     retry_col="$YEL"
     [ "$retry" -ge "$retry_limit" ] 2>/dev/null && retry_col="$RED"
+    # On re-plan (designer phase after a failure), make the marker explicit.
+    if [ "$phase" = "designing" ]; then
+      retry_suffix=" (replan)"
+    fi
   fi
-  line2="${line2}${DIM} · ${RST}${retry_col}retry ${retry}/${retry_limit}${RST}"
+  line2="${line2}${DIM} · ${RST}${retry_col}retry ${retry}/${retry_limit}${retry_suffix}${RST}"
+fi
+
+# Cycle elapsed clock — visible whenever cycle_started_at is known.
+if [ -n "$cycle_started_at" ]; then
+  cycle_elapsed="$(fmt_elapsed "$cycle_started_at")"
+  if [ -n "$cycle_elapsed" ]; then
+    line2="${line2}${DIM} · ${cycle_elapsed}${RST}"
+  fi
 fi
 
 if [ -n "$termination" ]; then
@@ -341,7 +373,100 @@ fi
 
 printf '%b\n' "$line2"
 
-# --- line 3+: one indented line per active worker ------------------------
+# --- line 3: phase detail (verifying / finalizing only) ------------------
+# During verifying, list the dynamic checks the Verifier was told to run.
+# During finalizing, rule-applier is running (V3 will replace this with a
+# live progress line; for now we surface that the phase is active so the
+# user knows the cycle is still working even though no executor workers
+# are visible).
+
+# Helper: parse a progress file ({current, started_at, completed[], total}) into
+# tab-separated "<current>\t<started_at>\t<completed_count>\t<total>". Empty if
+# the file is missing or invalid.
+read_progress() {
+  local pfile="$1"
+  [ -f "$pfile" ] || return
+  if [ "$PARSER" = jq ]; then
+    jq -r '[.current // "", .started_at // "", ((.completed // []) | length | tostring), (.total // 0 | tostring)] | @tsv' \
+      "$pfile" 2>/dev/null
+  else
+    python3 -c '
+import json, sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+completed = d.get("completed") or []
+print("\t".join([
+  str(d.get("current") or ""),
+  str(d.get("started_at") or ""),
+  str(len(completed)),
+  str(d.get("total") or 0),
+]))
+' "$pfile" 2>/dev/null
+  fi
+}
+
+case "$phase" in
+  verifying)
+    # V3: prefer live progress from .harness/verifier-progress.json
+    vprog="$(read_progress "${cwd}/.harness/verifier-progress.json")"
+    if [ -n "$vprog" ]; then
+      IFS=$'\t' read -r v_current v_started v_done v_total <<< "$vprog"
+      v_elapsed="$(fmt_elapsed "$v_started")"
+      v_position=$((v_done + 1))
+      if [ -n "$v_elapsed" ]; then
+        printf '%b  → verifier: %b%s%b %b(%s of %s · %s)%b\n' \
+          "$DIM" "$YEL" "$v_current" "$RST" \
+          "$DIM" "$v_position" "$v_total" "$v_elapsed" "$RST"
+      else
+        printf '%b  → verifier: %b%s%b %b(%s of %s)%b\n' \
+          "$DIM" "$YEL" "$v_current" "$RST" \
+          "$DIM" "$v_position" "$v_total" "$RST"
+      fi
+    else
+      # V2 fallback: show the verification_spec from state.json
+      if [ "$PARSER" = jq ]; then
+        vspec="$(jq -r '(.verification_spec // []) | join("\t")' "$state_file" 2>/dev/null)"
+      else
+        vspec="$(python3 -c '
+import json, sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+spec = d.get("verification_spec") or []
+print("\t".join(str(x) for x in spec))
+' "$state_file" 2>/dev/null)"
+      fi
+      if [ "$vspec" = "manual" ]; then
+        printf '%b  → verifier: %bmanual%b %b(deferred to user)%b\n' \
+          "$DIM" "$YEL" "$RST" "$DIM" "$RST"
+      elif [ -n "$vspec" ]; then
+        vspec_display="${vspec//$'\t'/, }"
+        printf '%b  → verifier: %b%s%b\n' "$DIM" "$YEL" "$vspec_display" "$RST"
+      fi
+    fi
+    ;;
+  finalizing)
+    # V3: prefer live progress from .harness/rule-applier-progress.json
+    rprog="$(read_progress "${cwd}/.harness/rule-applier-progress.json")"
+    if [ -n "$rprog" ]; then
+      IFS=$'\t' read -r r_current r_started r_done r_total <<< "$rprog"
+      r_elapsed="$(fmt_elapsed "$r_started")"
+      r_position=$((r_done + 1))
+      if [ -n "$r_elapsed" ]; then
+        printf '%b  → rule-applier: %b%s%b %b(%s of %s · %s)%b\n' \
+          "$DIM" "$YEL" "$r_current" "$RST" \
+          "$DIM" "$r_position" "$r_total" "$r_elapsed" "$RST"
+      else
+        printf '%b  → rule-applier: %b%s%b %b(%s of %s)%b\n' \
+          "$DIM" "$YEL" "$r_current" "$RST" \
+          "$DIM" "$r_position" "$r_total" "$RST"
+      fi
+    else
+      printf '%b  → rule-applier: review · security-review · post-finish%b\n' "$DIM" "$RST"
+    fi
+    ;;
+esac
+
+# --- line 4+: one indented line per active worker ------------------------
 # Each entry shows the worker's domain (or executor as fallback) plus elapsed
 # time since started_at. Skipped entirely when there are no active workers.
 
@@ -359,23 +484,6 @@ for w in (d.get("active_workers") or []):
     started = w.get("started_at") or ""
     print(f"{name}\t{started}")
 ' "$state_file" 2>/dev/null
-  fi
-}
-
-fmt_elapsed() {
-  local started="$1" started_s diff h m s
-  [ -z "$started" ] && return
-  started_s=$(date -d "$started" +%s 2>/dev/null) || return
-  diff=$(( $(date +%s) - started_s ))
-  [ "$diff" -lt 0 ] && diff=0
-  if   [ "$diff" -ge 3600 ]; then
-    h=$((diff / 3600)); m=$(((diff % 3600) / 60))
-    printf '%dh %dm' "$h" "$m"
-  elif [ "$diff" -ge 60 ]; then
-    m=$((diff / 60)); s=$((diff % 60))
-    printf '%dm %ds' "$m" "$s"
-  else
-    printf '%ds' "$diff"
   fi
 }
 
